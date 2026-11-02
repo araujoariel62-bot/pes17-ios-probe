@@ -99,7 +99,24 @@ static void ReportAddressSpace(void)
     uint8_t* base = ReserveGuestSpace();
     if (base) Line(@"reservar 4 GB (como o runtime): OK em %p", base);
     else      Line(@"reservar 4 GB (como o runtime): FALHOU, errno %d (%s)", errno, strerror(errno));
-    if (base) munmap(base, kSpace);
+    if (base)
+    {
+        // What is left for everything else (code, renderer, textures) while
+        // the guest space is held: count 64 MB blocks until mmap refuses.
+        enum { kMaxBlocks = 256 };
+        void* blocks[kMaxBlocks];
+        int count = 0;
+        while (count < kMaxBlocks)
+        {
+            void* block = mmap(NULL, 64 * MB, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+            if (block == MAP_FAILED) break;
+            blocks[count++] = block;
+        }
+        Line(@"com os 4 GB reservados, espaco de enderecos livre: ~%d MB%@", count * 64,
+             count == kMaxBlocks ? @" (ou mais)" : @"");
+        for (int i = 0; i < count; i++) munmap(blocks[i], 64 * MB);
+        munmap(base, kSpace);
+    }
     void* none = mmap(NULL, kSpace, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     Line(@"reservar 4 GB sem acesso (PROT_NONE): %@", none == MAP_FAILED ? @"FALHOU" : @"OK");
     if (none != MAP_FAILED) munmap(none, kSpace);
@@ -280,36 +297,45 @@ static void RunLoadTest(void)
     const long page = sysconf(_SC_PAGESIZE);
     const uint64_t step = 128 * MB;
     uint64_t touched = 0;
-    uint8_t* extra = NULL;
-    uint64_t extraSize = 0;
-    // As the game fills it: the bank, then the far heap, then plain extra memory.
+    // As the game fills it: the bank, then the far heap (both inside the 4 GB
+    // guest space), then host memory outside it in 128 MB blocks, as the
+    // renderer, textures and caches would take it. The outside blocks are
+    // separate mappings, so running out of address space shows up as a
+    // failed block, not as the whole test ending early.
     struct { uint8_t* start; uint64_t size; } regions[] = {
         { base + kCachedBase, kBankSize },
         { base + kFarBase, kFarEnd - kFarBase },
-        { NULL, 0 },
     };
-    for (int r = 0; r < 3; r++)
-    {
-        uint64_t size = regions[r].size;
-        uint8_t* start = regions[r].start;
-        if (!start)
+    for (int r = 0; r < 2; r++)
+        for (uint64_t offset = 0; offset < regions[r].size; offset += step)
         {
-            size = 2560 * MB;
-            void* mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (mapped == MAP_FAILED) { AppendLoadLog(@"mmap extra falhou"); break; }
-            start = extra = (uint8_t*)mapped;
-            extraSize = size;
-        }
-        for (uint64_t offset = 0; offset < size && touched < 4608 * MB; offset += step)
-        {
-            AppendLoadLog([NSString stringWithFormat:@"tocando %llu MB (disponivel antes: %.0f MB)",
+            AppendLoadLog([NSString stringWithFormat:@"guest: tocando %llu MB (disponivel antes: %.0f MB)",
                            (touched + step) / MB, AvailableMB()]);
-            for (uint64_t p = 0; p < step; p += (uint64_t)page) start[offset + p] = 1;
+            for (uint64_t p = 0; p < step; p += (uint64_t)page) regions[r].start[offset + p] = 1;
             touched += step;
         }
+
+    enum { kMaxBlocks = 64 };
+    void* blocks[kMaxBlocks];
+    int blockCount = 0;
+    NSString* reason = @"limite do teste (8 GB) alcancado";
+    while (blockCount < kMaxBlocks)
+    {
+        void* block = mmap(NULL, step, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (block == MAP_FAILED)
+        {
+            reason = [NSString stringWithFormat:@"sem espaco de enderecos para mais um bloco (errno %d)", errno];
+            break;
+        }
+        blocks[blockCount++] = block;
+        AppendLoadLog([NSString stringWithFormat:@"host: tocando +%d MB, total %llu MB (disponivel antes: %.0f MB)",
+                       blockCount * 128, (touched + step) / MB, AvailableMB()]);
+        for (uint64_t p = 0; p < step; p += (uint64_t)page) ((uint8_t*)block)[p] = 1;
+        touched += step;
     }
-    AppendLoadLog([NSString stringWithFormat:@"FIM: %llu MB tocados sem o app ser encerrado", touched / MB]);
-    if (extra) munmap(extra, extraSize);
+    AppendLoadLog([NSString stringWithFormat:@"FIM: %llu MB tocados (%d MB fora do guest) sem o app ser encerrado; parou por: %@",
+                   touched / MB, blockCount * 128, reason]);
+    for (int i = 0; i < blockCount; i++) munmap(blocks[i], step);
     munmap(base, kSpace);
 }
 
@@ -321,8 +347,9 @@ static void ReportPreviousLoadTest(void)
     if (!log) { Line(@"(ainda nao rodou; toque em \"Teste de carga\")"); return; }
     NSArray<NSString*>* lines = [log componentsSeparatedByString:@"\n"];
     NSString* last = @"";
-    for (NSString* l in lines) if (l.length) last = l;
-    if ([last hasPrefix:@"FIM"]) Line(@"%@", last);
+    NSString* beforeLast = @"";
+    for (NSString* l in lines) if (l.length) { beforeLast = last; last = l; }
+    if ([last hasPrefix:@"FIM"]) Line(@"ultimo passo: %@\n%@", beforeLast, last);
     else Line(@"o app foi encerrado pelo iOS durante: %@", last);
 }
 
@@ -376,7 +403,7 @@ static void ReportPreviousLoadTest(void)
 
 - (void)runTests
 {
-    g_report = [NSMutableString stringWithString:@"MemProbe 1.0 (PES 2017 recomp -> iOS)\n\n"];
+    g_report = [NSMutableString stringWithString:@"MemProbe 1.1 (PES 2017 recomp -> iOS)\n\n"];
     ReportDevice();
     ReportAddressSpace();
     ReportBank();
